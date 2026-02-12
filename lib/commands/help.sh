@@ -56,8 +56,8 @@ Special:
   Use '1' to open the main repo root: git gtr editor 1
 
 Available editors:
-  antigravity, atom, cursor, emacs, idea, nano, nvim, pycharm, sublime,
-  vim, vscode, webstorm, zed, none (or any command in your PATH)
+  atom, cursor, emacs, idea, nano, nvim, pycharm, sublime, vim, vscode,
+  webstorm, zed, antigravity, none (or any command in your PATH)
 
 Examples:
   git gtr editor my-feature                     # Uses default editor
@@ -593,10 +593,10 @@ CONFIGURATION OPTIONS:
   gtr.worktrees.prefix     Worktree folder prefix (default: "")
   gtr.defaultBranch        Default branch (default: auto)
   gtr.editor.default       Default editor
-                           Options: antigravity, cursor, vscode, zed, idea,
-                           pycharm, webstorm, vim, nvim, emacs, sublime,
-                           nano, atom, none
-  gtr.editor.workspace     Workspace file for Antigravity/VS Code/Cursor
+                           Options: cursor, vscode, zed, idea, pycharm,
+                           webstorm, vim, nvim, emacs, sublime, nano,
+                           atom, antigravity, none
+  gtr.editor.workspace     Workspace file for VS Code/Cursor/Antigravity
                            (relative path, auto-detects, or "none")
   gtr.ai.default           Default AI tool
                            Options: aider, auggie, claude, codex, continue,

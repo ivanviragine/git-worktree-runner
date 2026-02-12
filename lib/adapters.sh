@@ -253,7 +253,7 @@ _editor_define_terminal() {
   }
 }
 
-# Resolve workspace file for Antigravity/VS Code/Cursor editors
+# Resolve workspace file for VS Code/Cursor/Antigravity editors
 # Returns the workspace file path if found, empty otherwise
 resolve_workspace_file() {
   local worktree_path="$1"
