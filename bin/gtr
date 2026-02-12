@@ -10,7 +10,7 @@ if [ -n "${GTR_DEBUG:-}" ]; then
 fi
 
 # Version
-GTR_VERSION="2.2.0"
+GTR_VERSION="2.3.0"
 
 # Find the script directory (resolve symlinks; allow env override)
 resolve_script_dir() {
