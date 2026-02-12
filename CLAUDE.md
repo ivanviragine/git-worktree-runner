@@ -12,9 +12,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Development/testing**: `./bin/gtr <command>` (direct execution)
 - **User-facing docs**: Always reference `git gtr`, never `./bin/gtr`
 
-## CRITICAL: No Automated Tests
+## Testing
 
-This project has **no test suite**. All testing is manual. After any change, run the relevant smoke tests:
+This project uses **BATS tests** for core functions and **manual smoke tests** for end-to-end workflows. CI runs ShellCheck + BATS automatically on PRs (`.github/workflows/lint.yml`).
+
+1. Run automated tests: `bats tests/`
+2. Run a single test file: `bats tests/config.bats`
+3. Run a single test by name: `bats tests/config.bats --filter "cfg_map_to_file_key"`
+4. Run relevant manual smoke tests:
 
 ```bash
 ./bin/gtr new test-feature          # Create worktree
@@ -25,7 +30,9 @@ This project has **no test suite**. All testing is manual. After any change, run
 ./bin/gtr rm test-feature           # Clean up
 ```
 
-For exhaustive testing (hooks, copy patterns, adapters, `--force`, `--from-current`, etc.), see the full checklist in CONTRIBUTING.md or `.github/instructions/testing.instructions.md`.
+For exhaustive manual testing (hooks, copy patterns, adapters, `--force`, `--from-current`, etc.), see the full checklist in CONTRIBUTING.md or `.github/instructions/testing.instructions.md`.
+
+**Test files**: `adapters`, `config`, `copy_safety`, `integration_lifecycle`, `parse_args`, `provider`, `resolve_base_dir`, `sanitize_branch_name` (all in `tests/`). Shared fixtures in `tests/test_helper.bash`.
 
 **Tip**: Use a disposable repo for testing to avoid polluting your working tree:
 
@@ -39,28 +46,35 @@ mkdir -p /tmp/gtr-test && cd /tmp/gtr-test && git init && git commit --allow-emp
 ### Binary Structure
 
 - `bin/git-gtr` — Thin wrapper enabling `git gtr` subcommand invocation
-- `bin/gtr` — Main script (~1960 lines), contains `main()` dispatcher + all `cmd_*` handlers
+- `bin/gtr` — Entry point: sources libraries and commands, contains `main()` dispatcher
 
 ### Module Structure
 
-| File              | Purpose                                                                                                     |
-| ----------------- | ----------------------------------------------------------------------------------------------------------- |
-| `lib/core.sh`     | Worktree CRUD: `create_worktree`, `remove_worktree`, `list_worktrees`, `resolve_target`, `resolve_base_dir` |
-| `lib/config.sh`   | Git config wrapper with precedence: `cfg_get`, `cfg_default`, `cfg_get_all`                                 |
-| `lib/copy.sh`     | File/directory copying with glob patterns: `copy_patterns`, `copy_directories`                              |
-| `lib/hooks.sh`    | Hook execution: `run_hooks_in` for postCreate/preRemove/postRemove                                          |
-| `lib/ui.sh`       | Logging (`log_error`, `log_info`, `log_warn`), prompts, formatting                                          |
-| `lib/platform.sh` | OS detection, GUI helpers                                                                                   |
+| File                | Purpose                                                                                                     |
+| ------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `lib/ui.sh`         | Logging (`log_error`, `log_info`, `log_warn`), prompts, formatting                                          |
+| `lib/args.sh`       | Shared argument parser: flag specs (`--flag`, `--flag: val`, aliases), populates `_arg_*` vars              |
+| `lib/config.sh`     | Git config wrapper with precedence: `cfg_get`, `cfg_default`, `cfg_get_all`                                 |
+| `lib/platform.sh`   | OS detection, GUI helpers                                                                                   |
+| `lib/core.sh`       | Worktree CRUD: `create_worktree`, `remove_worktree`, `list_worktrees`, `resolve_target`, `resolve_base_dir` |
+| `lib/copy.sh`       | File/directory copying with glob patterns: `copy_patterns`, `copy_directories`                              |
+| `lib/hooks.sh`      | Hook execution: `run_hooks_in` for postCreate/preRemove/postRemove                                          |
+| `lib/provider.sh`   | Remote hosting detection (GitHub/GitLab) and CLI integration for `clean --merged`                           |
+| `lib/adapters.sh`   | Adapter registry, builder functions, generic fallbacks, loader functions                                    |
+| `lib/launch.sh`     | Editor/AI launch orchestration: `_open_editor`, `_auto_launch_editor`, `_auto_launch_ai`                    |
+| `lib/commands/*.sh` | One file per subcommand: `cmd_create`, `cmd_remove`, etc. (16 files)                                        |
+
+Libraries are sourced in the order listed above (ui → args → config → ... → launch → commands/\*.sh glob).
 
 ### Adapters
 
-Editor adapters in `adapters/editor/` and AI adapters in `adapters/ai/` are dynamically sourced via `load_editor_adapter()` and `load_ai_adapter()` in `bin/gtr`.
+Most adapters are defined declaratively in the **adapter registry** (`lib/adapters.sh`) using pipe-delimited entries. Custom adapters that need special logic remain as override files in `adapters/editor/` and `adapters/ai/`.
 
-**Editor adapters** (atom, cursor, emacs, idea, nano, nvim, pycharm, sublime, vim, vscode, webstorm, zed): implement `editor_can_open()` + `editor_open(path)`.
+**Registry-defined adapters**: atom, cursor, emacs, idea, nvim, pycharm, sublime, vim, vscode, webstorm, zed (editors) and aider, auggie, codex, continue, copilot, gemini, opencode (AI).
 
-**AI adapters** (aider, auggie, claude, codex, continue, copilot, cursor, gemini, opencode): implement `ai_can_start()` + `ai_start(path, args...)`.
+**Custom adapter files**: `adapters/editor/nano.sh`, `adapters/ai/claude.sh`, `adapters/ai/cursor.sh` — these implement `editor_can_open()`/`editor_open()` or `ai_can_start()`/`ai_start()` directly.
 
-**Generic fallback**: `GTR_EDITOR_CMD` / `GTR_AI_CMD` env vars allow custom tools without adapter files.
+**Loading order**: file override → registry → generic PATH fallback. `GTR_EDITOR_CMD` / `GTR_AI_CMD` env vars allow custom tools without adapters.
 
 ### Command Flow
 
@@ -106,15 +120,17 @@ cmd_editor() → resolve_target() → load_editor_adapter() → editor_open()
 
 ### Adding a New Command
 
-1. Add `cmd_<name>()` function in `bin/gtr`
-2. Add case entry in `main()` dispatcher (around line 71)
-3. Add help text in `cmd_help()`
+1. Create `lib/commands/<name>.sh` with `cmd_<name>()` function
+2. Add case entry in `main()` dispatcher in `bin/gtr`
+3. Add help text in `lib/commands/help.sh`
 4. Update all three completion files: `completions/gtr.bash`, `completions/_git-gtr`, `completions/git-gtr.fish`
 5. Update README.md
 
 ### Adding an Adapter
 
-Create `adapters/{editor,ai}/<name>.sh` implementing the two required functions (see existing adapters for patterns). Then update: help text in `cmd_help()` and `load_*_adapter()`, all three completions, README.md.
+**Standard adapters** (just a command name + error message): Add an entry to `_EDITOR_REGISTRY` or `_AI_REGISTRY` in `lib/adapters.sh`. Then update: help text in `lib/commands/help.sh`, all three completions, README.md.
+
+**Custom adapters** (special logic needed): Create `adapters/{editor,ai}/<name>.sh` implementing the two required functions (see `adapters/ai/claude.sh` for an example). File-based adapters take priority over registry entries.
 
 ### Updating the Version
 
@@ -127,6 +143,17 @@ When adding commands or flags, update all three files:
 - `completions/gtr.bash` (Bash)
 - `completions/_git-gtr` (Zsh)
 - `completions/git-gtr.fish` (Fish)
+
+## Critical Gotcha: `set -e`
+
+`bin/gtr` runs with `set -e`. Any unguarded non-zero return silently exits the entire script. When calling functions that may `return 1`, guard with `|| true`:
+
+```bash
+result=$(my_func) || true           # Prevents silent exit
+if my_func; then ...; fi            # Also safe (if guards the return)
+```
+
+This is the most common source of subtle bugs in this codebase.
 
 ## Code Style
 

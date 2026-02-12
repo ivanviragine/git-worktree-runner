@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # Core git worktree operations
 
+# --- Context Globals Contract ---
+# Resolver functions set these globals as a return mechanism (Bash lacks multi-return).
+# Callers should copy into locals immediately after calling the resolver.
+#
+# resolve_repo_context() -> _ctx_repo_root  _ctx_base_dir  _ctx_prefix
+# resolve_worktree()     -> _ctx_is_main    _ctx_worktree_path  _ctx_branch
+declare _ctx_repo_root _ctx_base_dir _ctx_prefix
+declare _ctx_is_main _ctx_worktree_path _ctx_branch
+
 # Discover the root of the current git repository
 # Returns: absolute path to repo root
 # Exit code: 0 on success, 1 if not in a git repo
@@ -54,10 +63,12 @@ resolve_base_dir() {
     # Default: <repo>-worktrees next to the repo
     base_dir="$(dirname "$repo_root")/${repo_name}-worktrees"
   else
-    # Expand tilde to home directory
+    # Expand literal tilde to home directory
+    # Patterns must quote ~ to prevent bash tilde expansion in case arms
+    # shellcheck disable=SC2088
     case "$base_dir" in
-      ~/*) base_dir="$HOME/${base_dir#~/}" ;;
-      ~) base_dir="$HOME" ;;
+      "~/"*) base_dir="$HOME/${base_dir#"~/"}" ;;
+      "~") base_dir="$HOME" ;;
     esac
 
     # Check if absolute or relative
@@ -89,7 +100,7 @@ resolve_base_dir() {
 
   # Warn if worktree dir is inside repo (but not a sibling)
   if [[ "$base_dir" == "$canonical_repo_root"/* ]]; then
-    local rel_path="${base_dir#$canonical_repo_root/}"
+    local rel_path="${base_dir#"$canonical_repo_root"/}"
     # Check if .gitignore exists and whether it includes the worktree directory
     if [ -f "$canonical_repo_root/.gitignore" ]; then
       if ! grep -qE "^/?${rel_path}/?\$|^/?${rel_path}/\*?\$" "$canonical_repo_root/.gitignore" 2>/dev/null; then
@@ -139,24 +150,33 @@ resolve_default_branch() {
   fi
 }
 
-# Get the current branch of a worktree
+# Get current branch name with Git 2.22+ fallback
+# Usage: get_current_branch [directory]
+# Returns: branch name, "HEAD" if detached, or empty
+get_current_branch() {
+  if [ -n "${1:-}" ]; then
+    git -C "$1" branch --show-current 2>/dev/null ||
+      git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null
+  else
+    git branch --show-current 2>/dev/null ||
+      git rev-parse --abbrev-ref HEAD 2>/dev/null
+  fi
+}
+
+# Get the current branch of a worktree (with detached HEAD normalization)
 # Usage: current_branch worktree_path
 current_branch() {
   local worktree_path="$1"
-  local branch
 
   if [ ! -d "$worktree_path" ]; then
     return 1
   fi
 
-  # Try --show-current (Git 2.22+), fallback to rev-parse for older Git
-  branch=$(cd "$worktree_path" && git branch --show-current 2>/dev/null)
-  if [ -z "$branch" ]; then
-    branch=$(cd "$worktree_path" && git rev-parse --abbrev-ref HEAD 2>/dev/null)
-  fi
+  local branch
+  branch=$(get_current_branch "$worktree_path")
 
-  # Normalize detached HEAD
-  if [ "$branch" = "HEAD" ]; then
+  # Normalize detached HEAD or empty (failed detection)
+  if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
     branch="(detached)"
   fi
 
@@ -225,22 +245,19 @@ resolve_target() {
   local repo_root="$2"
   local base_dir="$3"
   local prefix="$4"
-  local id path branch sanitized_name
+  local path branch sanitized_name
 
   # Special case: ID 1 is always the repo root
   if [ "$identifier" = "1" ]; then
     path="$repo_root"
-    # Try --show-current (Git 2.22+), fallback to rev-parse for older Git
-    branch=$(git -C "$repo_root" branch --show-current 2>/dev/null)
-    [ -z "$branch" ] && branch=$(git -C "$repo_root" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    branch=$(get_current_branch "$repo_root")
     printf "1\t%s\t%s\n" "$path" "$branch"
     return 0
   fi
 
   # For all other identifiers, treat as branch name
   # First check if it's the current branch in repo root (if not ID 1)
-  branch=$(git -C "$repo_root" branch --show-current 2>/dev/null)
-  [ -z "$branch" ] && branch=$(git -C "$repo_root" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  branch=$(get_current_branch "$repo_root")
   if [ "$branch" = "$identifier" ]; then
     printf "1\t%s\t%s\n" "$repo_root" "$identifier"
     return 0
@@ -280,26 +297,40 @@ unpack_target() {
   read _ctx_is_main _ctx_worktree_path _ctx_branch <<< "$1"
 }
 
-# Create a new git worktree
-# Usage: create_worktree base_dir prefix branch_name from_ref track_mode [skip_fetch] [force] [custom_name] [folder_override]
-# track_mode: auto, remote, local, or none
-# skip_fetch: 0 (default, fetch) or 1 (skip)
-# force: 0 (default, check branch) or 1 (allow same branch in multiple worktrees)
-# custom_name: optional custom name suffix (e.g., "backend" creates "feature-auth-backend")
-# folder_override: optional complete folder name override (replaces default naming)
-create_worktree() {
-  local base_dir="$1"
-  local prefix="$2"
-  local branch_name="$3"
-  local from_ref="$4"
-  local track_mode="${5:-auto}"
-  local skip_fetch="${6:-0}"
-  local force="${7:-0}"
-  local custom_name="${8:-}"
-  local folder_override="${9:-}"
-  local sanitized_name worktree_path
+# Resolve an identifier to a worktree and set _ctx_* variables in one step
+# Usage: resolve_worktree <identifier> <repo_root> <base_dir> <prefix>
+# Sets: _ctx_is_main, _ctx_worktree_path, _ctx_branch
+resolve_worktree() {
+  local target
+  target=$(resolve_target "$1" "$2" "$3" "$4") || return 1
+  unpack_target "$target"
+}
 
-  # Construct folder name
+# Try to create a worktree, handling the common log/add/report pattern.
+# Usage: _try_worktree_add <path> <step_msg> <ok_msg> [git_worktree_add_args...]
+# Prints worktree path on success; returns 1 on failure (caller handles error).
+# Note: step_msg may be empty to skip the log_step call.
+_try_worktree_add() {
+  local wt_path="$1" step_msg="$2" ok_msg="$3"
+  shift 3
+
+  [ -n "$step_msg" ] && log_step "$step_msg"
+
+  if git worktree add "$wt_path" "$@" >&2; then
+    log_info "$ok_msg"
+    printf "%s" "$wt_path"
+    return 0
+  fi
+  return 1
+}
+
+# Build and validate folder name from branch/custom/override.
+# Prints sanitized folder name on success; returns 1 on validation failure.
+# Usage: _resolve_folder_name <branch_name> [custom_name] [folder_override]
+_resolve_folder_name() {
+  local branch_name="$1" custom_name="${2:-}" folder_override="${3:-}"
+  local sanitized_name
+
   if [ -n "$folder_override" ]; then
     sanitized_name=$(sanitize_branch_name "$folder_override")
   elif [ -n "$custom_name" ]; then
@@ -308,7 +339,6 @@ create_worktree() {
     sanitized_name=$(sanitize_branch_name "$branch_name")
   fi
 
-  # Validate sanitized name is not empty or path traversal attempt
   if [ -z "$sanitized_name" ] || [ "$sanitized_name" = "." ] || [ "$sanitized_name" = ".." ]; then
     if [ -n "$folder_override" ]; then
       log_error "Invalid --folder value: $folder_override"
@@ -318,110 +348,118 @@ create_worktree() {
     return 1
   fi
 
-  worktree_path="$base_dir/${prefix}${sanitized_name}"
-  local force_flag=""
+  printf "%s" "$sanitized_name"
+}
 
-  if [ "$force" -eq 1 ]; then
-    force_flag="--force"
+# Check if a branch exists on remote and/or locally.
+# Sets globals: _wt_remote_exists, _wt_local_exists (0 or 1)
+# Usage: _check_branch_refs <branch_name>
+declare _wt_remote_exists _wt_local_exists
+_check_branch_refs() {
+  _wt_remote_exists=0
+  _wt_local_exists=0
+  git show-ref --verify --quiet "refs/remotes/origin/$1" && _wt_remote_exists=1
+  git show-ref --verify --quiet "refs/heads/$1" && _wt_local_exists=1
+  return 0
+}
+
+# Auto-track: create local tracking branch from remote if needed, then add worktree.
+# Usage: _worktree_add_tracked <worktree_path> <branch_name> [force_args...]
+# shellcheck disable=SC2317  # Called indirectly from create_worktree
+_worktree_add_tracked() {
+  local wt_path="$1" branch_name="$2"
+  shift 2
+
+  log_step "Branch '$branch_name' exists on remote"
+  if git branch --track "$branch_name" "origin/$branch_name" >/dev/null 2>&1; then
+    log_info "Created local branch tracking origin/$branch_name"
   fi
+  _try_worktree_add "$wt_path" "" \
+    "Worktree created tracking origin/$branch_name" \
+    "$@" "$branch_name"
+}
 
-  # Check if worktree already exists
+# Create a new git worktree
+# Usage: create_worktree base_dir prefix branch_name from_ref track_mode [skip_fetch] [force] [custom_name] [folder_override]
+# track_mode: auto, remote, local, or none
+# skip_fetch: 0 (default, fetch) or 1 (skip)
+# force: 0 (default, check branch) or 1 (allow same branch in multiple worktrees)
+# custom_name: optional custom name suffix (e.g., "backend" creates "feature-auth-backend")
+# folder_override: optional complete folder name override (replaces default naming)
+create_worktree() {
+  local base_dir="$1" prefix="$2" branch_name="$3" from_ref="$4"
+  local track_mode="${5:-auto}" skip_fetch="${6:-0}" force="${7:-0}"
+  local custom_name="${8:-}" folder_override="${9:-}"
+
+  local sanitized_name
+  sanitized_name=$(_resolve_folder_name "$branch_name" "$custom_name" "$folder_override") || return 1
+
+  local worktree_path="$base_dir/${prefix}${sanitized_name}"
+  local force_args=()
+  [ "$force" -eq 1 ] && force_args=(--force)
+
   if [ -d "$worktree_path" ]; then
     log_error "Worktree $sanitized_name already exists at $worktree_path"
     return 1
   fi
 
-  # Create base directory if needed
   mkdir -p "$base_dir"
 
-  # Fetch latest refs (unless --no-fetch)
   if [ "$skip_fetch" -eq 0 ]; then
     log_step "Fetching remote branches..."
     git fetch origin 2>/dev/null || log_warn "Could not fetch from origin"
   fi
 
-  local remote_exists=0
-  local local_exists=0
-
-  git show-ref --verify --quiet "refs/remotes/origin/$branch_name" && remote_exists=1
-  git show-ref --verify --quiet "refs/heads/$branch_name" && local_exists=1
+  _check_branch_refs "$branch_name"
 
   case "$track_mode" in
     remote)
-      # Force use of remote branch
-      if [ "$remote_exists" -eq 1 ]; then
-        log_step "Creating worktree from remote branch origin/$branch_name"
-        if git worktree add $force_flag "$worktree_path" -b "$branch_name" "origin/$branch_name" >&2 || \
-           git worktree add $force_flag "$worktree_path" "$branch_name" >&2; then
-          log_info "Worktree created tracking origin/$branch_name"
-          printf "%s" "$worktree_path"
-          return 0
-        fi
-      else
-        log_error "Remote branch origin/$branch_name does not exist"
-        return 1
+      if [ "$_wt_remote_exists" -eq 1 ]; then
+        _try_worktree_add "$worktree_path" \
+          "Creating worktree from remote branch origin/$branch_name" \
+          "Worktree created tracking origin/$branch_name" \
+          "${force_args[@]}" -b "$branch_name" "origin/$branch_name" && return 0
+        _try_worktree_add "$worktree_path" "" \
+          "Worktree created tracking origin/$branch_name" \
+          "${force_args[@]}" "$branch_name" && return 0
       fi
+      log_error "Remote branch origin/$branch_name does not exist"
+      return 1
       ;;
 
     local)
-      # Force use of local branch
-      if [ "$local_exists" -eq 1 ]; then
-        log_step "Creating worktree from local branch $branch_name"
-        if git worktree add $force_flag "$worktree_path" "$branch_name" >&2; then
-          log_info "Worktree created with local branch $branch_name"
-          printf "%s" "$worktree_path"
-          return 0
-        fi
-      else
-        log_error "Local branch $branch_name does not exist"
-        return 1
+      if [ "$_wt_local_exists" -eq 1 ]; then
+        _try_worktree_add "$worktree_path" \
+          "Creating worktree from local branch $branch_name" \
+          "Worktree created with local branch $branch_name" \
+          "${force_args[@]}" "$branch_name" && return 0
       fi
+      log_error "Local branch $branch_name does not exist"
+      return 1
       ;;
 
     none)
-      # Create new branch from from_ref
-      log_step "Creating new branch $branch_name from $from_ref"
-      if git worktree add $force_flag "$worktree_path" -b "$branch_name" "$from_ref" >&2; then
-        log_info "Worktree created with new branch $branch_name"
-        printf "%s" "$worktree_path"
-        return 0
-      else
-        log_error "Failed to create worktree with new branch"
-        return 1
-      fi
+      _try_worktree_add "$worktree_path" \
+        "Creating new branch $branch_name from $from_ref" \
+        "Worktree created with new branch $branch_name" \
+        "${force_args[@]}" -b "$branch_name" "$from_ref" && return 0
+      log_error "Failed to create worktree with new branch"
+      return 1
       ;;
 
     auto|*)
-      # Auto-detect best option with proper tracking
-      if [ "$remote_exists" -eq 1 ] && [ "$local_exists" -eq 0 ]; then
-        # Remote exists, no local branch - create local with tracking
-        log_step "Branch '$branch_name' exists on remote"
-
-        # Create tracking branch first for explicit upstream configuration
-        if git branch --track "$branch_name" "origin/$branch_name" >/dev/null 2>&1; then
-          log_info "Created local branch tracking origin/$branch_name"
-        fi
-
-        # Now add worktree using the tracking branch
-        if git worktree add $force_flag "$worktree_path" "$branch_name" >&2; then
-          log_info "Worktree created tracking origin/$branch_name"
-          printf "%s" "$worktree_path"
-          return 0
-        fi
-      elif [ "$local_exists" -eq 1 ]; then
-        log_step "Using existing local branch $branch_name"
-        if git worktree add $force_flag "$worktree_path" "$branch_name" >&2; then
-          log_info "Worktree created with local branch $branch_name"
-          printf "%s" "$worktree_path"
-          return 0
-        fi
+      if [ "$_wt_remote_exists" -eq 1 ] && [ "$_wt_local_exists" -eq 0 ]; then
+        _worktree_add_tracked "$worktree_path" "$branch_name" "${force_args[@]}" && return 0
+      elif [ "$_wt_local_exists" -eq 1 ]; then
+        _try_worktree_add "$worktree_path" \
+          "Using existing local branch $branch_name" \
+          "Worktree created with local branch $branch_name" \
+          "${force_args[@]}" "$branch_name" && return 0
       else
-        log_step "Creating new branch $branch_name from $from_ref"
-        if git worktree add $force_flag "$worktree_path" -b "$branch_name" "$from_ref" >&2; then
-          log_info "Worktree created with new branch $branch_name"
-          printf "%s" "$worktree_path"
-          return 0
-        fi
+        _try_worktree_add "$worktree_path" \
+          "Creating new branch $branch_name from $from_ref" \
+          "Worktree created with new branch $branch_name" \
+          "${force_args[@]}" -b "$branch_name" "$from_ref" && return 0
       fi
       ;;
   esac
@@ -441,13 +479,13 @@ remove_worktree() {
     return 1
   fi
 
-  local force_flag=""
+  local force_args=()
   if [ "$force" -eq 1 ]; then
-    force_flag="--force"
+    force_args=(--force)
   fi
 
   local remove_output
-  if remove_output=$(git worktree remove $force_flag "$worktree_path" 2>&1); then
+  if remove_output=$(git worktree remove "${force_args[@]}" "$worktree_path" 2>&1); then
     log_info "Worktree removed: $worktree_path"
     return 0
   else
@@ -458,11 +496,6 @@ remove_worktree() {
     fi
     return 1
   fi
-}
-
-# List all worktrees
-list_worktrees() {
-  git worktree list
 }
 
 # Resolve common repo context used by most cmd_* handlers.
