@@ -134,7 +134,7 @@ git gtr config set gtr.provider github
 ## Editor Settings
 
 ```bash
-# Default editor: cursor, vscode, zed, antigravity, or none
+# Default editor: antigravity, cursor, vscode, zed, or none
 gtr.editor.default = cursor
 
 # Workspace file for VS Code/Cursor/Antigravity (relative path from worktree root)
@@ -146,9 +146,9 @@ gtr.editor.workspace = project.code-workspace
 
 **Setup editors:**
 
+- **Antigravity**: Install from [antigravity.google](https://antigravity.google), `agy` command available after installation
 - **Cursor**: Install from [cursor.com](https://cursor.com), enable shell command
 - **VS Code**: Install from [code.visualstudio.com](https://code.visualstudio.com), enable `code` command
-- **Antigravity**: Install from [antigravity.google](https://antigravity.google), `agy` command available after installation
 - **Zed**: Install from [zed.dev](https://zed.dev), `zed` command available automatically
 
 **Workspace files:**
