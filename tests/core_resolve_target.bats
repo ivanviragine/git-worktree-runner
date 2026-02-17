@@ -80,3 +80,35 @@ teardown() {
   run resolve_worktree "nope" "$TEST_REPO" "$TEST_WORKTREES_DIR" ""
   [ "$status" -eq 1 ]
 }
+
+# ── porcelain fallback ─────────────────────────────────────────────────────────
+
+@test "resolve_target finds externally-created worktree via porcelain fallback" {
+  # Create a worktree with raw git (outside gtr-managed directory)
+  local ext_dir="${TEST_REPO}-external"
+  git -C "$TEST_REPO" worktree add "$ext_dir" -b external-branch --quiet
+  local result
+  result=$(resolve_target "external-branch" "$TEST_REPO" "$TEST_WORKTREES_DIR" "")
+  # Assert: found with is_main=0, correct branch, path ends with expected suffix
+  [[ "$result" == "0"$'\t'*"-external"$'\t'"external-branch" ]]
+}
+
+# ── discover_repo_root from worktree ──────────────────────────────────────────
+
+@test "discover_repo_root returns main repo root when called from a worktree" {
+  create_test_worktree "inside-wt"
+  cd "$TEST_WORKTREES_DIR/inside-wt"
+  local root expected
+  root=$(discover_repo_root)
+  # Resolve symlinks (macOS: /var -> /private/var) for comparison
+  expected=$(cd "$TEST_REPO" && pwd -P)
+  [ "$root" = "$expected" ]
+}
+
+@test "discover_repo_root returns main repo root when called from main repo" {
+  cd "$TEST_REPO"
+  local root expected
+  root=$(discover_repo_root)
+  expected=$(pwd -P)
+  [ "$root" = "$expected" ]
+}
